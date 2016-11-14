@@ -48,8 +48,10 @@ real node_server::get_rotation_count() const {
 
 hpx::future<void> node_server::exchange_flux_corrections() {
 	const geo::octant ci = my_location.get_child_index();
-	auto ptr_futs = std::make_shared<std::list<hpx::future<void>>>();
-	for (auto& f : geo::face::full_set()) {
+    std::vector<hpx::future<void>> futs;
+    auto full_set = geo::face::full_set();
+    futs.reserve(full_set.size());
+	for (auto& f : full_set) {
 		const auto face_dim = f.get_dimension();
 		auto& this_aunt = aunts[f];
 		if (!this_aunt.empty()) {
@@ -63,12 +65,13 @@ hpx::future<void> node_server::exchange_flux_corrections() {
 			}
 			ub[face_dim] = lb[face_dim] + 1;
 			auto data = grid_ptr->get_flux_restrict(lb, ub, face_dim);
-			ptr_futs->push_back(this_aunt.send_hydro_flux_correct(std::move(data), f.flip(), ci));
+			futs.push_back(this_aunt.send_hydro_flux_correct(std::move(data), f.flip(), ci));
 		}
 	}
-	return hpx::async([=]() {
+
+	return hpx::async([this](hpx::future<void> fut) {
 		for (auto& f : geo::face::full_set()) {
-			if (nieces[f].size()) {
+			if (this->nieces[f].size()) {
 				const auto face_dim = f.get_dimension();
 				for (auto& quadrant : geo::quadrant::full_set()) {
 					std::array<integer, NDIM> lb, ub;
@@ -103,10 +106,8 @@ hpx::future<void> node_server::exchange_flux_corrections() {
 				}
 			}
 		}
-		for (auto&& f : *ptr_futs) {
-			f.get();
-		}
-	});
+        fut.get();
+	}, hpx::when_all(futs));
 }
 
 hpx::future<void> node_server::all_hydro_bounds(bool tau_only) {
@@ -114,7 +115,7 @@ hpx::future<void> node_server::all_hydro_bounds(bool tau_only) {
 	fut.push_back(exchange_interlevel_hydro_data());
 	fut.push_back(collect_hydro_boundaries(tau_only));
 	fut.push_back(send_hydro_amr_boundaries(tau_only));
-	return hpx::when_all(std::begin(fut), std::end(fut));
+	return hpx::when_all(fut);
 }
 
 hpx::future<void> node_server::exchange_interlevel_hydro_data() {
@@ -144,8 +145,10 @@ hpx::future<void> node_server::exchange_interlevel_hydro_data() {
 }
 
 hpx::future<void> node_server::collect_hydro_boundaries(bool tau_only) {
-	std::list<hpx::future<void>> futs;
-	for (auto& dir : geo::direction::full_set()) {
+    std::vector<hpx::future<void>> futs;
+    auto full_set = geo::direction::full_set();
+    futs.reserve(full_set.size());
+	for (auto& dir : full_set) {
 //		if (!dir.is_vertex()) {
 		if (!neighbors[dir].empty()) {
 //				const integer width = dir.is_face() ? H_BW : 1;
@@ -173,15 +176,17 @@ hpx::future<void> node_server::collect_hydro_boundaries(bool tau_only) {
 		}
 	}
 
-	return hpx::when_all(std::begin(futs), std::end(futs));
+	return hpx::when_all(futs);
 
 }
 
 hpx::future<void> node_server::send_hydro_amr_boundaries(bool tau_only) {
 	hpx::future<void> fut;
 	if (is_refined) {
-		std::list<hpx::future<void>> futs;
-		for (auto& ci : geo::octant::full_set()) {
+		std::vector<hpx::future<void>> futs;
+        auto full_set = geo::octant::full_set();
+        futs.reserve(full_set.size());
+		for (auto& ci : full_set) {
 			const auto& flags = amr_flags[ci];
 			for (auto& dir : geo::direction::full_set()) {
 				//			if (!dir.is_vertex()) {
@@ -205,7 +210,7 @@ hpx::future<void> node_server::send_hydro_amr_boundaries(bool tau_only) {
 			}
 //			}
 		}
-		fut = hpx::when_all(std::begin(futs), std::end(futs));
+		fut = hpx::when_all(futs);
 	} else {
 		fut = hpx::make_ready_future();
 
@@ -360,9 +365,8 @@ void node_server::compute_fmm(gsolve_type type, bool energy_account) {
 		return;
 	}
 
-	std::list<hpx::future<void>> child_futs;
-	std::list<hpx::future<void>> neighbor_futs;
 	hpx::future<void> parent_fut;
+
 	if (energy_account) {
 	//	printf( "!\n");
 		grid_ptr->egas_to_etot();
@@ -371,22 +375,35 @@ void node_server::compute_fmm(gsolve_type type, bool energy_account) {
 	m_out.first.resize(INX * INX * INX);
 	m_out.second.resize(INX * INX * INX);
 	if (is_refined) {
-		for (auto& ci : geo::octant::full_set()) {
-			const integer x0 = ci.get_side(XDIM) * INX / 2;
-			const integer y0 = ci.get_side(YDIM) * INX / 2;
-			const integer z0 = ci.get_side(ZDIM) * INX / 2;
-			m_in = child_gravity_channels[ci].get_future().get();
-			for (integer i = 0; i != INX / 2; ++i) {
-				for (integer j = 0; j != INX / 2; ++j) {
-					for (integer k = 0; k != INX / 2; ++k) {
-						const integer ii = i * INX * INX / 4 + j * INX / 2 + k;
-						const integer io = (i + x0) * INX * INX + (j + y0) * INX + k + z0;
-						m_out.first[io] = m_in.first[ii];
-						m_out.second[io] = m_in.second[ii];
-					}
-				}
-			}
+        std::vector<hpx::future<void>> futs;
+        auto full_set = geo::octant::full_set();
+        futs.reserve(full_set.size());
+		for (auto& ci : full_set) {
+            hpx::future<multipole_pass_type> m_in_future = child_gravity_channels[ci].get_future();
+
+            futs.push_back(
+                m_in_future.then(
+                    [&m_out, ci](hpx::future<multipole_pass_type>&& fut)
+                    {
+                        const integer x0 = ci.get_side(XDIM) * INX / 2;
+                        const integer y0 = ci.get_side(YDIM) * INX / 2;
+                        const integer z0 = ci.get_side(ZDIM) * INX / 2;
+                        auto m_in = fut.get();
+                        for (integer i = 0; i != INX / 2; ++i) {
+                            for (integer j = 0; j != INX / 2; ++j) {
+                                for (integer k = 0; k != INX / 2; ++k) {
+                                    const integer ii = i * INX * INX / 4 + j * INX / 2 + k;
+                                    const integer io = (i + x0) * INX * INX + (j + y0) * INX + k + z0;
+                                    m_out.first[io] = m_in.first[ii];
+                                    m_out.second[io] = m_in.second[ii];
+                                }
+                            }
+                        }
+                    }
+                )
+            );
 		}
+        hpx::when_all(futs).get();
 		m_out = grid_ptr->compute_multipoles(type, &m_out);
 	} else {
 		m_out = grid_ptr->compute_multipoles(type);
@@ -398,7 +415,10 @@ void node_server::compute_fmm(gsolve_type type, bool energy_account) {
 		parent_fut = hpx::make_ready_future();
 	}
 
-	for (auto& dir : geo::direction::full_set()) {
+	std::vector<hpx::future<void>> neighbor_futs;
+    auto full_set = geo::direction::full_set();
+    neighbor_futs.reserve(full_set.size());
+	for (auto& dir : full_set) {
 		if (!neighbors[dir].empty()) {
 			auto ndir = dir.flip();
 			const bool is_monopole = !is_refined;
@@ -410,54 +430,71 @@ void node_server::compute_fmm(gsolve_type type, bool energy_account) {
 
 	grid_ptr->compute_interactions(type);
 
-	for (auto& dir : geo::direction::full_set()) {
+	std::vector<hpx::future<void>> boundary_futs;
+    boundary_futs.reserve(full_set.size());
+	for (auto& dir : full_set) {
 		if (!neighbors[dir].empty()) {
-			auto tmp = neighbor_gravity_channels[dir].get_future().get();
-			grid_ptr->compute_boundary_interactions(type, tmp.direction, tmp.is_monopole, tmp.data);
+		    boundary_futs.push_back(neighbor_gravity_channels[dir].get_future().then(
+                [this, type](hpx::future<neighbor_gravity_type> fut)
+                {
+                    auto tmp = fut.get();
+                    grid_ptr->compute_boundary_interactions(type, tmp.direction, tmp.is_monopole, tmp.data);
+                }
+            ));
 		}
 	}
 	parent_fut.get();
+    hpx::when_all(boundary_futs).get();
 
 	expansion_pass_type l_in;
 	if (my_location.level() != 0) {
 		l_in = parent_gravity_channel.get_future().get();
 	}
 	const expansion_pass_type ltmp = grid_ptr->compute_expansions(type, my_location.level() == 0 ? nullptr : &l_in);
-	if (is_refined) {
-		for (auto& ci : geo::octant::full_set()) {
-			expansion_pass_type l_out;
-			l_out.first.resize(INX * INX * INX / NCHILD);
-			if (type == RHO) {
-				l_out.second.resize(INX * INX * INX / NCHILD);
-			}
-			const integer x0 = ci.get_side(XDIM) * INX / 2;
-			const integer y0 = ci.get_side(YDIM) * INX / 2;
-			const integer z0 = ci.get_side(ZDIM) * INX / 2;
-			for (integer i = 0; i != INX / 2; ++i) {
-				for (integer j = 0; j != INX / 2; ++j) {
-					for (integer k = 0; k != INX / 2; ++k) {
-						const integer io = i * INX * INX / 4 + j * INX / 2 + k;
-						const integer ii = (i + x0) * INX * INX + (j + y0) * INX + k + z0;
-						auto t = ltmp.first[ii];
-						l_out.first[io] = t;
-						if (type == RHO) {
-							l_out.second[io] = ltmp.second[ii];
-						}
-					}
-				}
-			}
-			child_futs.push_back(children[ci].send_gravity_expansions(std::move(l_out)));
-		}
-	}
 
-	if (energy_account) {
-		grid_ptr->etot_to_egas();
-	}
+    auto f = [this, type, energy_account](expansion_pass_type ltmp)
+    {
+        std::vector<hpx::future<void>> child_futs;
+        if (is_refined) {
+            auto full_set = geo::octant::full_set();
+            child_futs.reserve(full_set.size());
+            for (auto& ci : full_set) {
+                expansion_pass_type l_out;
+                l_out.first.resize(INX * INX * INX / NCHILD);
+                if (type == RHO) {
+                    l_out.second.resize(INX * INX * INX / NCHILD);
+                }
+                const integer x0 = ci.get_side(XDIM) * INX / 2;
+                const integer y0 = ci.get_side(YDIM) * INX / 2;
+                const integer z0 = ci.get_side(ZDIM) * INX / 2;
+                for (integer i = 0; i != INX / 2; ++i) {
+                    for (integer j = 0; j != INX / 2; ++j) {
+                        for (integer k = 0; k != INX / 2; ++k) {
+                            const integer io = i * INX * INX / 4 + j * INX / 2 + k;
+                            const integer ii = (i + x0) * INX * INX + (j + y0) * INX + k + z0;
+                            auto t = ltmp.first[ii];
+                            l_out.first[io] = t;
+                            if (type == RHO) {
+                                l_out.second[io] = ltmp.second[ii];
+                            }
+                        }
+                    }
+                }
+                child_futs.push_back(children[ci].send_gravity_expansions(std::move(l_out)));
+            }
+        }
 
-	for (auto&& fut : child_futs) {
-		fut.get();
-	}
-	for (auto&& fut : neighbor_futs) {
-		fut.get();
-	}
+        if (energy_account) {
+            grid_ptr->etot_to_egas();
+        }
+
+        return child_futs;
+    };
+
+    hpx::when_all(hpx::when_all(f(ltmp)), hpx::when_all(neighbor_futs)).get();
+}
+
+void node_server::report_timing()
+{
+    timings_.report("...");
 }
